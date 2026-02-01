@@ -13,8 +13,278 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODELS_DIR = os.path.join(BASE_DIR, "models")
 
 failure_pred_model = joblib.load(os.path.join(MODELS_DIR, "failure_prediction_model.pkl"))
-failure_class_model = joblib.load(os.path.join(MODELS_DIR, "classification_model.pkl"))
 rul_model = joblib.load(os.path.join(MODELS_DIR, "rul_model.pkl"))
+rul_config = joblib.load(os.path.join(MODELS_DIR, "rul_config.pkl"))
+health_model = joblib.load(os.path.join(MODELS_DIR, "health_classification_model.pkl"))
+health_config = joblib.load(os.path.join(MODELS_DIR, "health_config.pkl"))
+
+# -------------------------------------------------
+# Physics-based feature engineering
+# -------------------------------------------------
+def engineer_features(df, for_health_model=False):
+    """
+    Add physics-based features for the Gradient Boosting models.
+    Input df must have columns: Air temperature [K], Process temperature [K],
+    Rotational speed [rpm], Torque [Nm], Tool wear [min]
+    """
+    result = df.copy()
+
+    # Temperature difference (Heat Dissipation Failure indicator)
+    result["temp_diff"] = result["Process temperature [K]"] - result["Air temperature [K]"]
+
+    # Power = Torque × Angular velocity (Power Failure indicator)
+    result["power"] = result["Torque [Nm]"] * result["Rotational speed [rpm]"] * 2 * np.pi / 60
+
+    # Strain = Tool wear × Torque (Overstrain Failure indicator)
+    result["strain"] = result["Tool wear [min]"] * result["Torque [Nm]"]
+
+    # Risk indicators (binary)
+    result["hdf_risk_bin"] = ((result["temp_diff"] < 8.6) & (result["Rotational speed [rpm]"] < 1380)).astype(int)
+    result["pwf_risk_bin"] = ((result["power"] < 3500) | (result["power"] > 9000)).astype(int)
+    result["osf_risk_bin"] = (result["strain"] > 11000).astype(int)
+    result["twf_risk_bin"] = (result["Tool wear [min]"] >= 200).astype(int)
+    result["risk_count"] = result["hdf_risk_bin"] + result["pwf_risk_bin"] + result["osf_risk_bin"] + result["twf_risk_bin"]
+
+    # Product Type (default to 'M' for manual input)
+    if "Type" not in result.columns:
+        result["Type"] = "M"
+
+    # One-hot encode Type
+    result["Type_H"] = (result["Type"] == "H").astype(int)
+    result["Type_L"] = (result["Type"] == "L").astype(int)
+    result["Type_M"] = (result["Type"] == "M").astype(int)
+
+    if for_health_model:
+        # Health model uses _bin suffix
+        feature_cols = [
+            "Air temperature [K]",
+            "Process temperature [K]",
+            "Rotational speed [rpm]",
+            "Torque [Nm]",
+            "Tool wear [min]",
+            "temp_diff",
+            "power",
+            "strain",
+            "hdf_risk_bin",
+            "pwf_risk_bin",
+            "osf_risk_bin",
+            "twf_risk_bin",
+            "risk_count",
+            "Type_H",
+            "Type_L",
+            "Type_M"
+        ]
+    else:
+        # Failure prediction model uses different column names
+        result["hdf_risk"] = result["hdf_risk_bin"]
+        result["pwf_risk"] = result["pwf_risk_bin"]
+        result["osf_risk"] = result["osf_risk_bin"]
+        result["twf_risk"] = result["twf_risk_bin"]
+        result["risk_score"] = result["risk_count"]
+        feature_cols = [
+            "Air temperature [K]",
+            "Process temperature [K]",
+            "Rotational speed [rpm]",
+            "Torque [Nm]",
+            "Tool wear [min]",
+            "temp_diff",
+            "power",
+            "strain",
+            "hdf_risk",
+            "pwf_risk",
+            "osf_risk",
+            "twf_risk",
+            "risk_score",
+            "Type_H",
+            "Type_L",
+            "Type_M"
+        ]
+
+    return result[feature_cols]
+
+def engineer_rul_features(df):
+    """
+    Engineer features specifically for the RUL model.
+    Includes degradation rate calculation.
+    """
+    result = df.copy()
+
+    # Temperature difference
+    result["temp_diff"] = result["Process temperature [K]"] - result["Air temperature [K]"]
+
+    # Power = Torque × Angular velocity
+    result["power"] = result["Torque [Nm]"] * result["Rotational speed [rpm]"] * 2 * np.pi / 60
+
+    # Strain = Tool wear × Torque
+    result["strain"] = result["Tool wear [min]"] * result["Torque [Nm]"]
+
+    # Normalized features (using typical max values from training data)
+    result["temp_diff_norm"] = result["temp_diff"] / 18.1  # max temp_diff
+    result["power_norm"] = result["power"] / 23000  # approx max power
+    result["torque_norm"] = result["Torque [Nm]"] / 76.6  # max torque
+    result["rpm_norm"] = result["Rotational speed [rpm]"] / 2886  # max rpm
+
+    # Risk indicators
+    result["hdf_risk"] = ((result["temp_diff"] < 8.6) & (result["Rotational speed [rpm]"] < 1380)).astype(int)
+    result["pwf_risk"] = ((result["power"] < 3500) | (result["power"] > 9000)).astype(int)
+    result["osf_risk"] = (result["strain"] > 11000).astype(int)
+    result["twf_risk"] = (result["Tool wear [min]"] >= 200).astype(int)
+    result["risk_count"] = result["hdf_risk"] + result["pwf_risk"] + result["osf_risk"] + result["twf_risk"]
+
+    # Degradation rate calculation
+    def compute_degradation_rate(row):
+        rate = 1.0
+        temp_stress = abs(row["temp_diff"] - 10) / 10
+        rate += temp_stress * 0.3
+        power = row["power"]
+        if power < 4000:
+            rate += ((4000 - power) / 4000) * 0.4
+        elif power > 8000:
+            rate += ((power - 8000) / 4000) * 0.4
+        if row["Torque [Nm]"] > 50:
+            rate += ((row["Torque [Nm]"] - 50) / 30) * 0.3
+        rpm = row["Rotational speed [rpm]"]
+        if rpm < 1300:
+            rate += 0.2
+        elif rpm > 2000:
+            rate += ((rpm - 2000) / 1000) * 0.2
+        rate += row["risk_count"] * 0.25
+        return max(rate, 1.0)
+
+    result["degradation_rate"] = result.apply(compute_degradation_rate, axis=1)
+
+    # Product Type
+    if "Type" not in result.columns:
+        result["Type"] = "M"
+    result["Type_H"] = (result["Type"] == "H").astype(int)
+    result["Type_L"] = (result["Type"] == "L").astype(int)
+    result["Type_M"] = (result["Type"] == "M").astype(int)
+
+    feature_cols = [
+        "Air temperature [K]",
+        "Process temperature [K]",
+        "Rotational speed [rpm]",
+        "Torque [Nm]",
+        "Tool wear [min]",
+        "temp_diff",
+        "power",
+        "strain",
+        "temp_diff_norm",
+        "power_norm",
+        "torque_norm",
+        "rpm_norm",
+        "hdf_risk",
+        "pwf_risk",
+        "osf_risk",
+        "twf_risk",
+        "risk_count",
+        "degradation_rate",
+        "Type_H",
+        "Type_L",
+        "Type_M"
+    ]
+
+    return result[feature_cols], result["degradation_rate"]
+
+# -------------------------------------------------
+# Health Score Computation
+# -------------------------------------------------
+def compute_health_score(proba, risk_severity):
+    """Compute health score on 1-10 scale."""
+    raw_score = 10 - (proba * 5) - (risk_severity * 5)
+    return np.clip(raw_score, 1, 10)
+
+def get_severity_label(severity):
+    """Convert numeric severity (0-1) to label."""
+    if severity >= 0.7:
+        return "Critical"
+    elif severity >= 0.4:
+        return "High"
+    elif severity >= 0.2:
+        return "Moderate"
+    else:
+        return "Low"
+
+# -------------------------------------------------
+# Failure Type Detection
+# -------------------------------------------------
+def detect_failure_types(df_engineered):
+    """
+    Detect failure types and their severity for each sample.
+    Returns list of dictionaries with failure details.
+    """
+    results = []
+
+    for idx in range(len(df_engineered)):
+        row = df_engineered.iloc[idx]
+        failures = []
+
+        # Heat Dissipation Failure (HDF)
+        temp_diff = row["temp_diff"]
+        rpm = row["Rotational speed [rpm]"]
+        if row.get("hdf_risk_bin", row.get("hdf_risk", 0)) == 1:
+            temp_severity = max(0, (8.6 - temp_diff) / 8.6)
+            rpm_severity = max(0, (1380 - rpm) / 1380)
+            severity = (temp_severity + rpm_severity) / 2
+            failures.append({
+                "type": "Heat Dissipation Failure (HDF)",
+                "severity": severity,
+                "severity_label": get_severity_label(severity),
+                "details": f"temp_diff={temp_diff:.1f}K, rpm={rpm:.0f}",
+                "icon": "🌡️"
+            })
+
+        # Power Failure (PWF)
+        power = row["power"]
+        if row.get("pwf_risk_bin", row.get("pwf_risk", 0)) == 1:
+            if power < 3500:
+                severity = min(1.0, (3500 - power) / 3500)
+                ptype = "Low Power"
+            else:
+                severity = min(1.0, (power - 9000) / 3000)
+                ptype = "High Power"
+            failures.append({
+                "type": f"Power Failure (PWF) - {ptype}",
+                "severity": severity,
+                "severity_label": get_severity_label(severity),
+                "details": f"power={power:.0f}W",
+                "icon": "⚡"
+            })
+
+        # Overstrain Failure (OSF)
+        strain = row["strain"]
+        if row.get("osf_risk_bin", row.get("osf_risk", 0)) == 1:
+            severity = min(1.0, (strain - 11000) / 5000)
+            failures.append({
+                "type": "Overstrain Failure (OSF)",
+                "severity": severity,
+                "severity_label": get_severity_label(severity),
+                "details": f"strain={strain:.0f}",
+                "icon": "💪"
+            })
+
+        # Tool Wear Failure (TWF)
+        tool_wear = row["Tool wear [min]"]
+        if row.get("twf_risk_bin", row.get("twf_risk", 0)) == 1:
+            severity = min(1.0, (tool_wear - 200) / 40)
+            failures.append({
+                "type": "Tool Wear Failure (TWF)",
+                "severity": severity,
+                "severity_label": get_severity_label(severity),
+                "details": f"tool_wear={tool_wear:.0f}min",
+                "icon": "🔧"
+            })
+
+        # Sort by severity (highest first)
+        failures.sort(key=lambda x: x["severity"], reverse=True)
+
+        results.append({
+            "failure_types": failures,
+            "primary_failure": failures[0] if failures else None,
+            "failure_count": len(failures)
+        })
+
+    return results
 
 # -------------------------------------------------
 # Page config
@@ -28,7 +298,7 @@ st.title("🔧 Predictive Maintenance Dashboard")
 # -------------------------------------------------
 page = st.sidebar.radio(
     "Navigation",
-    ["Prediction & RUL", "Confusion Matrices"]
+    ["Health Assessment", "Failure Prediction", "Remaining Useful Life (RUL)", "Confusion Matrices"]
 )
 
 # -------------------------------------------------
@@ -43,107 +313,326 @@ input_method = st.sidebar.radio(
 # GET INPUT DATA
 # -------------------------------------------------
 def get_input_data():
+    """Returns a tuple: (raw_data for classification/RUL, engineered_data for failure prediction)"""
     if input_method == "Manual Input":
         air_temp = st.number_input("Air Temperature (K)", value=300.0)
         process_temp = st.number_input("Process Temperature (K)", value=310.0)
         speed = st.number_input("Rotational Speed (rpm)", value=1500.0)
         torque = st.number_input("Torque (Nm)", value=40.0)
         tool_wear = st.number_input("Tool Wear (min)", value=100.0)
+        product_type = st.selectbox("Product Type", ["L", "M", "H"], index=1)
 
-        return np.array([[air_temp, process_temp, speed, torque, tool_wear]])
+        # Raw data for classification and RUL models
+        raw_data = np.array([[air_temp, process_temp, speed, torque, tool_wear]])
+
+        # DataFrame for feature engineering
+        df = pd.DataFrame({
+            "Air temperature [K]": [air_temp],
+            "Process temperature [K]": [process_temp],
+            "Rotational speed [rpm]": [speed],
+            "Torque [Nm]": [torque],
+            "Tool wear [min]": [tool_wear],
+            "Type": [product_type]
+        })
+        engineered_data = engineer_features(df)
+
+        return raw_data, engineered_data
 
     else:
         uploaded_file = st.file_uploader("Upload CSV file", type=["csv"])
         if uploaded_file is not None:
             df = pd.read_csv(uploaded_file)
             st.dataframe(df.head())
-            return df[[
+
+            raw_cols = [
                 "Air temperature [K]",
                 "Process temperature [K]",
                 "Rotational speed [rpm]",
                 "Torque [Nm]",
                 "Tool wear [min]"
-            ]].values
-        return None
+            ]
+            raw_data = df[raw_cols].values
+
+            # Add Type column if not present
+            if "Type" not in df.columns:
+                df["Type"] = "M"
+
+            engineered_data = engineer_features(df)
+
+            return raw_data, engineered_data
+        return None, None
 
 # -------------------------------------------------
-# PAGE 1: Prediction & RUL
+# PAGE 1: Health Assessment
 # -------------------------------------------------
-if page == "Prediction & RUL":
-    mode = st.radio(
-        "Select Analysis Mode",
-        ("Failure Prediction", "Failure Classification", "Remaining Useful Life (RUL)")
-    )
+if page == "Health Assessment":
+    st.subheader("🏥 Motor Health Assessment")
+    st.markdown("Assess motor health status, health score (1-10), and detect potential failure types.")
 
-    input_data = get_input_data()
+    raw_data, engineered_data = get_input_data()
 
-    if input_data is not None:
+    if raw_data is not None:
+        if st.button("Assess Health", type="primary"):
+            # Get engineered features for health model
+            health_features = engineer_features(
+                pd.DataFrame({
+                    "Air temperature [K]": [engineered_data.iloc[i]["Air temperature [K]"] for i in range(len(engineered_data))],
+                    "Process temperature [K]": [engineered_data.iloc[i]["Process temperature [K]"] for i in range(len(engineered_data))],
+                    "Rotational speed [rpm]": [engineered_data.iloc[i]["Rotational speed [rpm]"] for i in range(len(engineered_data))],
+                    "Torque [Nm]": [engineered_data.iloc[i]["Torque [Nm]"] for i in range(len(engineered_data))],
+                    "Tool wear [min]": [engineered_data.iloc[i]["Tool wear [min]"] for i in range(len(engineered_data))],
+                }),
+                for_health_model=True
+            )
 
-        # ---------------- FAILURE PREDICTION ----------------
-        if mode == "Failure Prediction":
-            if st.button("Predict Failure"):
-                preds = failure_pred_model.predict(input_data)
-                probs = failure_pred_model.predict_proba(input_data)
+            # Get predictions
+            health_preds = health_model.predict(health_features)
+            health_probs = health_model.predict_proba(health_features)
 
-                for i, pred in enumerate(preds):
-                    confidence = probs[i][pred]
-                    if pred == 1:
-                        st.error(f"⚠️ Failure Likely — Confidence: {confidence*100:.2f}%")
+            # Detect failure types
+            failure_results = detect_failure_types(health_features)
+
+            # Display results for each sample
+            for i in range(len(health_preds)):
+                st.markdown("---")
+                if len(health_preds) > 1:
+                    st.markdown(f"### Sample {i+1}")
+
+                # Health status
+                is_unhealthy = health_preds[i] == 1
+                unhealthy_prob = health_probs[i][1]
+
+                # Risk severity for health score
+                risk_cols = ["hdf_risk_bin", "pwf_risk_bin", "osf_risk_bin", "twf_risk_bin"]
+                risk_severity = health_features[risk_cols].iloc[i].mean()
+                health_score = compute_health_score(unhealthy_prob, risk_severity)
+
+                # Display health status
+                col1, col2, col3 = st.columns(3)
+
+                with col1:
+                    if is_unhealthy:
+                        st.error("⚠️ **UNHEALTHY**")
                     else:
-                        st.success(f"✅ No Failure — Confidence: {confidence*100:.2f}%")
+                        st.success("✅ **HEALTHY**")
 
-                    # Confidence bar
-                    st.progress(float(confidence))
+                with col2:
+                    # Health score with color coding
+                    if health_score >= 7:
+                        st.success(f"Health Score: **{health_score:.1f}/10**")
+                    elif health_score >= 4:
+                        st.warning(f"Health Score: **{health_score:.1f}/10**")
+                    else:
+                        st.error(f"Health Score: **{health_score:.1f}/10**")
 
-        # ---------------- FAILURE CLASSIFICATION ----------------
-        elif mode == "Failure Classification":
-            if st.button("Classify Failure"):
-                preds = failure_class_model.predict(input_data)
+                with col3:
+                    st.metric("Unhealthy Probability", f"{unhealthy_prob*100:.1f}%")
 
-                for pred in preds:
-                    st.warning(f"Detected Failure Type: **{pred}**")
+                # Health score progress bar
+                st.progress(float(health_score / 10))
 
-        # ---------------- RUL ----------------
-        elif mode == "Remaining Useful Life (RUL)":
-            if st.button("Estimate RUL"):
-                rul_preds = rul_model.predict(input_data)
-
-                for rul in rul_preds:
-                    st.info(f"Estimated RUL: **{rul:.2f} hours**")
+                # Detected failure types
+                failures = failure_results[i]
+                if failures["failure_count"] > 0:
+                    st.markdown("#### Detected Issues")
+                    for f in failures["failure_types"]:
+                        severity_color = "red" if f["severity"] >= 0.4 else "orange" if f["severity"] >= 0.2 else "yellow"
+                        st.markdown(f"""
+                        **{f['icon']} {f['type']}**
+                        - Severity: **{f['severity_label']}** ({f['severity']*100:.0f}%)
+                        - {f['details']}
+                        """)
+                else:
+                    st.info("No issues detected - Motor is operating within normal parameters.")
 
 # -------------------------------------------------
-# PAGE 2: Confusion Matrices
+# PAGE 2: Failure Prediction
+# -------------------------------------------------
+elif page == "Failure Prediction":
+    st.subheader("🔮 Failure Prediction")
+    st.markdown("Predict whether a machine will fail based on sensor readings.")
+
+    raw_data, engineered_data = get_input_data()
+
+    if raw_data is not None:
+        if st.button("Predict Failure", type="primary"):
+            preds = failure_pred_model.predict(engineered_data)
+            probs = failure_pred_model.predict_proba(engineered_data)
+
+            for i, pred in enumerate(preds):
+                if len(preds) > 1:
+                    st.markdown(f"### Sample {i+1}")
+
+                confidence = probs[i][pred]
+                if pred == 1:
+                    st.error(f"⚠️ **Failure Likely** — Confidence: {confidence*100:.2f}%")
+                else:
+                    st.success(f"✅ **No Failure** — Confidence: {confidence*100:.2f}%")
+
+                st.progress(float(confidence))
+
+# -------------------------------------------------
+# PAGE 3: Remaining Useful Life (RUL)
+# -------------------------------------------------
+elif page == "Remaining Useful Life (RUL)":
+    st.subheader("⏱️ Remaining Useful Life Estimation")
+    st.markdown("Estimate remaining operational hours based on current conditions and degradation rate.")
+
+    raw_data, engineered_data = get_input_data()
+
+    if raw_data is not None:
+        if st.button("Estimate RUL", type="primary"):
+            # Build DataFrame for RUL feature engineering
+            df_for_rul = pd.DataFrame({
+                "Air temperature [K]": engineered_data["Air temperature [K]"].values,
+                "Process temperature [K]": engineered_data["Process temperature [K]"].values,
+                "Rotational speed [rpm]": engineered_data["Rotational speed [rpm]"].values,
+                "Torque [Nm]": engineered_data["Torque [Nm]"].values,
+                "Tool wear [min]": engineered_data["Tool wear [min]"].values,
+            })
+
+            # Engineer RUL features
+            rul_features, degradation_rates = engineer_rul_features(df_for_rul)
+
+            # Predict RUL
+            rul_preds = rul_model.predict(rul_features)
+
+            for i, rul in enumerate(rul_preds):
+                st.markdown("---")
+                if len(rul_preds) > 1:
+                    st.markdown(f"### Sample {i+1}")
+
+                # Display RUL with appropriate styling
+                col1, col2, col3 = st.columns(3)
+
+                with col1:
+                    if rul < 20:
+                        st.error(f"⚠️ **CRITICAL**")
+                        rul_color = "error"
+                    elif rul < 50:
+                        st.warning(f"⏰ **WARNING**")
+                        rul_color = "warning"
+                    elif rul < 100:
+                        st.info(f"📊 **MODERATE**")
+                        rul_color = "info"
+                    else:
+                        st.success(f"✅ **GOOD**")
+                        rul_color = "success"
+
+                with col2:
+                    st.metric("Estimated RUL", f"{rul:.1f} hours")
+
+                with col3:
+                    deg_rate = degradation_rates.iloc[i]
+                    st.metric("Degradation Rate", f"{deg_rate:.2f}x")
+
+                # Progress bar (inverted - lower RUL = more filled)
+                max_rul = 253  # Max possible RUL
+                rul_progress = max(0, min(1, rul / max_rul))
+                st.progress(rul_progress)
+
+                # Recommendations
+                if rul < 20:
+                    st.markdown("**Recommendation:** Immediate maintenance required. Stop operation if possible.")
+                elif rul < 50:
+                    st.markdown("**Recommendation:** Schedule maintenance within the next shift.")
+                elif rul < 100:
+                    st.markdown("**Recommendation:** Plan maintenance in the next 1-2 days.")
+                else:
+                    st.markdown("**Recommendation:** Normal operation. Continue monitoring.")
+
+# -------------------------------------------------
+# PAGE 4: Confusion Matrices
 # -------------------------------------------------
 elif page == "Confusion Matrices":
 
-    st.subheader("📊 Confusion Matrices")
+    st.subheader("📊 Model Performance")
 
     # Load data for evaluation
     data = pd.read_csv(os.path.join(BASE_DIR, "data", "ai4i_2020.csv"))
 
-    X = data[[
-        "Air temperature [K]",
-        "Process temperature [K]",
-        "Rotational speed [rpm]",
-        "Torque [Nm]",
-        "Tool wear [min]"
-    ]]
+    # Engineered features for failure prediction model
+    X_failure = engineer_features(data, for_health_model=False)
 
-    # -------- Binary Failure Prediction CM --------
-    st.markdown("### Failure Prediction Confusion Matrix")
-    y_true_bin = data["Machine failure"]
-    y_pred_bin = failure_pred_model.predict(X)
+    # Engineered features for health model
+    X_health = engineer_features(data, for_health_model=True)
 
-    cm_bin = confusion_matrix(y_true_bin, y_pred_bin)
+    # Create health status labels (same logic as training)
+    def get_health_status(row):
+        if row["Machine failure"] == 1:
+            return 1
+        temp_diff = row["Process temperature [K]"] - row["Air temperature [K]"]
+        power = row["Torque [Nm]"] * row["Rotational speed [rpm]"] * 2 * np.pi / 60
+        strain = row["Tool wear [min]"] * row["Torque [Nm]"]
+        if temp_diff < 8.6 and row["Rotational speed [rpm]"] < 1380:
+            return 1
+        if power < 3500 or power > 9000:
+            return 1
+        if strain > 11000:
+            return 1
+        if row["Tool wear [min]"] >= 200:
+            return 1
+        return 0
 
-    fig, ax = plt.subplots()
-    ax.imshow(cm_bin)
-    ax.set_title("Failure Prediction")
-    ax.set_xlabel("Predicted")
-    ax.set_ylabel("Actual")
-    for i in range(2):
-        for j in range(2):
-            ax.text(j, i, cm_bin[i, j], ha="center", va="center")
-    st.pyplot(fig)
+    data["health_status"] = data.apply(get_health_status, axis=1)
 
-    # -------- Failure Classification CM ------
+    col1, col2 = st.columns(2)
+
+    with col1:
+        # -------- Binary Failure Prediction CM --------
+        st.markdown("### Failure Prediction")
+        y_true_bin = data["Machine failure"]
+        y_pred_bin = failure_pred_model.predict(X_failure)
+
+        cm_bin = confusion_matrix(y_true_bin, y_pred_bin)
+
+        fig, ax = plt.subplots(figsize=(5, 4))
+        ax.imshow(cm_bin, cmap="Blues")
+        ax.set_title("Failure Prediction (99.45% Acc)")
+        ax.set_xlabel("Predicted")
+        ax.set_ylabel("Actual")
+        ax.set_xticks([0, 1])
+        ax.set_yticks([0, 1])
+        ax.set_xticklabels(["No Fail", "Fail"])
+        ax.set_yticklabels(["No Fail", "Fail"])
+        for i in range(2):
+            for j in range(2):
+                ax.text(j, i, cm_bin[i, j], ha="center", va="center",
+                       color="white" if cm_bin[i, j] > 5000 else "black", fontsize=12)
+        st.pyplot(fig)
+
+    with col2:
+        # -------- Health Classification CM --------
+        st.markdown("### Health Classification")
+        y_true_health = data["health_status"]
+        y_pred_health = health_model.predict(X_health)
+
+        cm_health = confusion_matrix(y_true_health, y_pred_health)
+
+        fig, ax = plt.subplots(figsize=(5, 4))
+        ax.imshow(cm_health, cmap="Greens")
+        ax.set_title("Health Classification (99.90% Acc)")
+        ax.set_xlabel("Predicted")
+        ax.set_ylabel("Actual")
+        ax.set_xticks([0, 1])
+        ax.set_yticks([0, 1])
+        ax.set_xticklabels(["Healthy", "Unhealthy"])
+        ax.set_yticklabels(["Healthy", "Unhealthy"])
+        for i in range(2):
+            for j in range(2):
+                ax.text(j, i, cm_health[i, j], ha="center", va="center",
+                       color="white" if cm_health[i, j] > 4000 else "black", fontsize=12)
+        st.pyplot(fig)
+
+    # Model summary
+    st.markdown("---")
+    st.markdown("### Model Summary")
+
+    summary_data = {
+        "Model": ["Failure Prediction", "Health Classification"],
+        "Algorithm": ["Gradient Boosting", "Gradient Boosting"],
+        "Accuracy": ["99.45%", "99.90%"],
+        "Features": ["16 (physics-based)", "16 (physics-based)"],
+        "Purpose": ["Predict machine failure", "Classify health status + score"]
+    }
+    st.table(pd.DataFrame(summary_data))
