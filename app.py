@@ -446,30 +446,75 @@ if page == "Health Assessment":
                     st.info("No issues detected - Motor is operating within normal parameters.")
 
 # -------------------------------------------------
-# PAGE 2: Failure Prediction
+# PAGE 2: Failure Prediction (Multi-class)
 # -------------------------------------------------
 elif page == "Failure Prediction":
-    st.subheader("🔮 Failure Prediction")
-    st.markdown("Predict whether a machine will fail based on sensor readings.")
+    st.subheader("🔮 Failure Type Prediction")
+    st.markdown("Predict the specific type of failure based on sensor readings.")
+
+    # Failure type icons and colors
+    failure_icons = {
+        "No Failure": "✅",
+        "Tool Wear Failure": "🔧",
+        "Heat Dissipation Failure": "🌡️",
+        "Power Failure": "⚡",
+        "Overstrain Failure": "💪",
+        "Random Failure": "🎲"
+    }
+
+    failure_descriptions = {
+        "No Failure": "Machine is operating normally",
+        "Tool Wear Failure": "Tool has exceeded wear threshold (200-240 min)",
+        "Heat Dissipation Failure": "Insufficient heat dissipation (temp_diff < 8.6K, RPM < 1380)",
+        "Power Failure": "Power outside normal range (< 3500W or > 9000W)",
+        "Overstrain Failure": "Mechanical overstrain (strain > 11000)",
+        "Random Failure": "Random/unexplained failure event"
+    }
 
     raw_data, engineered_data = get_input_data()
 
     if raw_data is not None:
-        if st.button("Predict Failure", type="primary"):
+        if st.button("Predict Failure Type", type="primary"):
             preds = failure_pred_model.predict(engineered_data)
             probs = failure_pred_model.predict_proba(engineered_data)
+            class_names = failure_pred_model.classes_
 
             for i, pred in enumerate(preds):
+                st.markdown("---")
                 if len(preds) > 1:
                     st.markdown(f"### Sample {i+1}")
 
-                confidence = probs[i][pred]
-                if pred == 1:
-                    st.error(f"⚠️ **Failure Likely** — Confidence: {confidence*100:.2f}%")
-                else:
-                    st.success(f"✅ **No Failure** — Confidence: {confidence*100:.2f}%")
+                # Get confidence for predicted class
+                pred_idx = list(class_names).index(pred)
+                confidence = probs[i][pred_idx]
 
-                st.progress(float(confidence))
+                # Display prediction
+                icon = failure_icons.get(pred, "❓")
+                description = failure_descriptions.get(pred, "")
+
+                if pred == "No Failure":
+                    st.success(f"{icon} **{pred}**")
+                    st.markdown(f"*{description}*")
+                else:
+                    st.error(f"{icon} **{pred}**")
+                    st.markdown(f"*{description}*")
+
+                # Confidence
+                col1, col2 = st.columns([1, 3])
+                with col1:
+                    st.metric("Confidence", f"{confidence*100:.1f}%")
+                with col2:
+                    st.progress(float(confidence))
+
+                # Show top 3 predictions with probabilities
+                st.markdown("**Probability Distribution:**")
+                sorted_indices = np.argsort(probs[i])[::-1][:3]
+                for idx in sorted_indices:
+                    class_name = class_names[idx]
+                    prob = probs[i][idx]
+                    icon = failure_icons.get(class_name, "")
+                    if prob > 0.01:  # Only show if > 1%
+                        st.markdown(f"- {icon} {class_name}: {prob*100:.1f}%")
 
 # -------------------------------------------------
 # PAGE 3: Remaining Useful Life (RUL)
