@@ -304,12 +304,19 @@ st.markdown(
     <style>
     @import url('https://fonts.googleapis.com/css2?family=Syne:wght@400;500;600;700;800&display=swap');
 
-    html, body, [class*="css"], [data-testid="stAppViewContainer"], [data-testid="stSidebar"] {
+    html, body, [data-testid="stAppViewContainer"], [data-testid="stSidebar"] {
         font-family: 'Syne', sans-serif;
     }
 
-    h1, h2, h3, h4, h5, h6, p, label, span, button, input, textarea, select {
+    h1, h2, h3, h4, h5, h6, p, label, button, input, textarea, select, div, li {
         font-family: 'Syne', sans-serif !important;
+    }
+
+    .material-symbols-rounded,
+    .material-icons,
+    [data-testid="stSidebarCollapsedControl"] span,
+    [data-testid="collapsedControl"] span {
+        font-family: "Material Symbols Rounded", "Material Icons" !important;
     }
     </style>
     """,
