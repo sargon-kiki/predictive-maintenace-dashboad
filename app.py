@@ -291,6 +291,23 @@ def detect_failure_types(df_engineered):
 # -------------------------------------------------
 st.set_page_config(page_title="Predictive Maintenance Dashboard", layout="wide")
 
+st.markdown(
+    """
+    <style>
+    @import url('https://fonts.googleapis.com/css2?family=Syne:wght@400;500;600;700;800&display=swap');
+
+    html, body, [class*="css"], [data-testid="stAppViewContainer"], [data-testid="stSidebar"] {
+        font-family: 'Syne', sans-serif;
+    }
+
+    h1, h2, h3, h4, h5, h6, p, label, span, button, input, textarea, select {
+        font-family: 'Syne', sans-serif !important;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 st.title("🔧 Predictive Maintenance Dashboard")
 
 # -------------------------------------------------
@@ -602,6 +619,15 @@ elif page == "Confusion Matrices":
     # Engineered features for health model
     X_health = engineer_features(data, for_health_model=True)
 
+    failure_type_columns = ["TWF", "HDF", "PWF", "OSF", "RNF"]
+    failure_type_map = {
+        "TWF": "Tool Wear Failure",
+        "HDF": "Heat Dissipation Failure",
+        "PWF": "Power Failure",
+        "OSF": "Overstrain Failure",
+        "RNF": "Random Failure",
+    }
+
     # Create health status labels (same logic as training)
     def get_health_status(row):
         if row["Machine failure"] == 1:
@@ -621,19 +647,27 @@ elif page == "Confusion Matrices":
 
     data["health_status"] = data.apply(get_health_status, axis=1)
 
+    true_failure_flag_counts = data[failure_type_columns].sum(axis=1)
+    single_failure_rows = true_failure_flag_counts <= 1
+
+    y_true_failure_type = pd.Series("No Failure", index=data.index, dtype="object")
+    for col in failure_type_columns:
+        y_true_failure_type.loc[data[col] == 1] = failure_type_map[col]
+
     col1, col2 = st.columns(2)
 
     with col1:
         # -------- Binary Failure Prediction CM --------
-        st.markdown("### Failure Prediction")
+        st.markdown("### Failure Detection")
         y_true_bin = data["Machine failure"]
-        y_pred_bin = failure_pred_model.predict(X_failure)
+        y_pred_labels = failure_pred_model.predict(X_failure)
+        y_pred_bin = (y_pred_labels != "No Failure").astype(int)
 
-        cm_bin = confusion_matrix(y_true_bin, y_pred_bin)
+        cm_bin = confusion_matrix(y_true_bin, y_pred_bin, labels=[0, 1])
 
         fig, ax = plt.subplots(figsize=(5, 4))
         ax.imshow(cm_bin, cmap="Blues")
-        ax.set_title("Failure Prediction (99.45% Acc)")
+        ax.set_title("Binary Failure Detection from Failure Type Model")
         ax.set_xlabel("Predicted")
         ax.set_ylabel("Actual")
         ax.set_xticks([0, 1])
@@ -645,6 +679,7 @@ elif page == "Confusion Matrices":
                 ax.text(j, i, cm_bin[i, j], ha="center", va="center",
                        color="white" if cm_bin[i, j] > 5000 else "black", fontsize=12)
         st.pyplot(fig)
+        st.caption("Binary failure labels are derived from the multiclass failure type model output.")
 
     with col2:
         # -------- Health Classification CM --------
@@ -668,6 +703,43 @@ elif page == "Confusion Matrices":
                 ax.text(j, i, cm_health[i, j], ha="center", va="center",
                        color="white" if cm_health[i, j] > 4000 else "black", fontsize=12)
         st.pyplot(fig)
+
+    st.markdown("### Failure Type Classification")
+    class_labels = list(failure_pred_model.classes_)
+    y_pred_failure_type = failure_pred_model.predict(X_failure)
+    cm_failure_type = confusion_matrix(
+        y_true_failure_type[single_failure_rows],
+        y_pred_failure_type[single_failure_rows],
+        labels=class_labels,
+    )
+
+    fig, ax = plt.subplots(figsize=(9, 6))
+    ax.imshow(cm_failure_type, cmap="Oranges")
+    ax.set_title("Multiclass Failure Type Confusion Matrix")
+    ax.set_xlabel("Predicted")
+    ax.set_ylabel("Actual")
+    ax.set_xticks(np.arange(len(class_labels)))
+    ax.set_yticks(np.arange(len(class_labels)))
+    ax.set_xticklabels(class_labels, rotation=30, ha="right")
+    ax.set_yticklabels(class_labels)
+    threshold = cm_failure_type.max() / 2 if cm_failure_type.size else 0
+    for i in range(len(class_labels)):
+        for j in range(len(class_labels)):
+            ax.text(
+                j,
+                i,
+                cm_failure_type[i, j],
+                ha="center",
+                va="center",
+                color="white" if cm_failure_type[i, j] > threshold else "black",
+                fontsize=10,
+            )
+    fig.tight_layout()
+    st.pyplot(fig)
+    excluded_rows = int((~single_failure_rows).sum())
+    st.caption(
+        f"Multiclass evaluation excludes {excluded_rows} rows with multiple true failure flags because the model predicts one primary class per sample."
+    )
 
     # Model summary
     st.markdown("---")
