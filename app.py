@@ -494,7 +494,7 @@ elif page == "Health Assessment":
                     st.error(f"Health Score: **{health_score:.1f}/10**")
 
             with col3:
-                st.metric("Unhealthy Probability", f"{unhealthy_prob*100:.1f}%")
+                st.metric("Risk of Unhealthy State", f"{unhealthy_prob*100:.1f}%")
 
             # Health score progress bar
             st.progress(float(health_score / 10))
