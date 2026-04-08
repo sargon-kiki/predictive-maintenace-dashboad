@@ -18,6 +18,14 @@ rul_config = joblib.load(os.path.join(MODELS_DIR, "rul_config.pkl"))
 health_model = joblib.load(os.path.join(MODELS_DIR, "health_classification_model.pkl"))
 health_config = joblib.load(os.path.join(MODELS_DIR, "health_config.pkl"))
 
+RAW_INPUT_COLUMNS = [
+    "Air temperature [K]",
+    "Process temperature [K]",
+    "Rotational speed [rpm]",
+    "Torque [Nm]",
+    "Tool wear [min]",
+]
+
 # -------------------------------------------------
 # Physics-based feature engineering
 # -------------------------------------------------
@@ -315,155 +323,197 @@ st.title("🔧 Predictive Maintenance Dashboard")
 # -------------------------------------------------
 page = st.sidebar.radio(
     "Navigation",
-    ["Health Assessment", "Failure Prediction", "Remaining Useful Life (RUL)", "Confusion Matrices"]
+    [
+        "Manual Input",
+        "CSV Upload",
+        "Health Assessment",
+        "Failure Prediction",
+        "Remaining Useful Life (RUL)",
+    ]
 )
 
-# -------------------------------------------------
-# INPUT METHOD
-# -------------------------------------------------
-input_method = st.sidebar.radio(
-    "Input Method",
-    ["Manual Input", "CSV Upload"]
-)
+if "input_df" not in st.session_state:
+    st.session_state["input_df"] = None
+if "input_source" not in st.session_state:
+    st.session_state["input_source"] = None
+
+
+def normalize_input_df(df):
+    """Normalize uploaded/manual input into the shape expected by the models."""
+    missing_columns = [col for col in RAW_INPUT_COLUMNS if col not in df.columns]
+    if missing_columns:
+        raise ValueError(f"Missing required columns: {', '.join(missing_columns)}")
+
+    normalized_df = df.copy()
+    if "Type" not in normalized_df.columns:
+        normalized_df["Type"] = "M"
+    normalized_df["Type"] = normalized_df["Type"].fillna("M").astype(str).str.upper()
+    normalized_df.loc[~normalized_df["Type"].isin(["L", "M", "H"]), "Type"] = "M"
+
+    ordered_columns = RAW_INPUT_COLUMNS + ["Type"]
+    return normalized_df[ordered_columns]
+
+
+def get_saved_input_data():
+    """Return normalized input and derived feature sets from session state."""
+    input_df = st.session_state.get("input_df")
+    if input_df is None:
+        return None, None, None, None
+
+    normalized_df = normalize_input_df(input_df)
+    raw_data = normalized_df[RAW_INPUT_COLUMNS].values
+    failure_features = engineer_features(normalized_df, for_health_model=False)
+    health_features = engineer_features(normalized_df, for_health_model=True)
+    return normalized_df, raw_data, failure_features, health_features
+
+
+def show_input_status():
+    """Display the currently active input source and row count."""
+    input_df = st.session_state.get("input_df")
+    input_source = st.session_state.get("input_source")
+    if input_df is None:
+        st.info("No input data loaded yet. Use the Manual Input or CSV Upload page first.")
+        return False
+
+    st.caption(f"Using {len(input_df)} sample(s) from {input_source}.")
+    return True
 
 # -------------------------------------------------
-# GET INPUT DATA
+# PAGE 1: Manual Input
 # -------------------------------------------------
-def get_input_data():
-    """Returns a tuple: (raw_data for classification/RUL, engineered_data for failure prediction)"""
-    if input_method == "Manual Input":
+if page == "Manual Input":
+    st.subheader("🛠️ Manual Input")
+    st.markdown("Enter a single machine sample and save it for the assessment pages.")
+
+    with st.form("manual_input_form"):
         air_temp = st.number_input("Air Temperature (K)", value=300.0)
         process_temp = st.number_input("Process Temperature (K)", value=310.0)
         speed = st.number_input("Rotational Speed (rpm)", value=1500.0)
         torque = st.number_input("Torque (Nm)", value=40.0)
         tool_wear = st.number_input("Tool Wear (min)", value=100.0)
         product_type = st.selectbox("Product Type", ["L", "M", "H"], index=1)
+        save_manual_input = st.form_submit_button("Use Manual Input", type="primary")
 
-        # Raw data for classification and RUL models
-        raw_data = np.array([[air_temp, process_temp, speed, torque, tool_wear]])
+    if save_manual_input:
+        st.session_state["input_df"] = pd.DataFrame(
+            {
+                "Air temperature [K]": [air_temp],
+                "Process temperature [K]": [process_temp],
+                "Rotational speed [rpm]": [speed],
+                "Torque [Nm]": [torque],
+                "Tool wear [min]": [tool_wear],
+                "Type": [product_type],
+            }
+        )
+        st.session_state["input_source"] = "Manual Input"
+        st.success("Manual input saved. You can now use it across the assessment pages.")
 
-        # DataFrame for feature engineering
-        df = pd.DataFrame({
-            "Air temperature [K]": [air_temp],
-            "Process temperature [K]": [process_temp],
-            "Rotational speed [rpm]": [speed],
-            "Torque [Nm]": [torque],
-            "Tool wear [min]": [tool_wear],
-            "Type": [product_type]
-        })
-        engineered_data = engineer_features(df)
-
-        return raw_data, engineered_data
-
-    else:
-        uploaded_file = st.file_uploader("Upload CSV file", type=["csv"])
-        if uploaded_file is not None:
-            df = pd.read_csv(uploaded_file)
-            st.dataframe(df.head())
-
-            raw_cols = [
-                "Air temperature [K]",
-                "Process temperature [K]",
-                "Rotational speed [rpm]",
-                "Torque [Nm]",
-                "Tool wear [min]"
-            ]
-            raw_data = df[raw_cols].values
-
-            # Add Type column if not present
-            if "Type" not in df.columns:
-                df["Type"] = "M"
-
-            engineered_data = engineer_features(df)
-
-            return raw_data, engineered_data
-        return None, None
+    if st.session_state.get("input_source") == "Manual Input" and st.session_state.get("input_df") is not None:
+        st.markdown("### Current Manual Input")
+        st.dataframe(st.session_state["input_df"], use_container_width=True)
 
 # -------------------------------------------------
-# PAGE 1: Health Assessment
+# PAGE 2: CSV Upload
 # -------------------------------------------------
-if page == "Health Assessment":
+elif page == "CSV Upload":
+    st.subheader("📁 CSV Upload")
+    st.markdown("Upload a CSV once and reuse it across the assessment pages.")
+    st.caption("Required columns: Air temperature [K], Process temperature [K], Rotational speed [rpm], Torque [Nm], Tool wear [min]. Optional: Type.")
+
+    uploaded_file = st.file_uploader("Upload CSV file", type=["csv"])
+    if uploaded_file is not None:
+        uploaded_df = pd.read_csv(uploaded_file)
+        st.markdown("### Preview")
+        st.dataframe(uploaded_df.head(), use_container_width=True)
+
+        try:
+            normalized_df = normalize_input_df(uploaded_df)
+            st.success(f"CSV validated successfully. {len(normalized_df)} sample(s) ready.")
+            if st.button("Use Uploaded CSV", type="primary"):
+                st.session_state["input_df"] = normalized_df
+                st.session_state["input_source"] = "CSV Upload"
+                st.success("CSV data saved. You can now use it across the assessment pages.")
+        except ValueError as exc:
+            st.error(str(exc))
+
+    if st.session_state.get("input_source") == "CSV Upload" and st.session_state.get("input_df") is not None:
+        st.markdown("### Current Uploaded Data")
+        st.dataframe(st.session_state["input_df"].head(), use_container_width=True)
+
+# -------------------------------------------------
+# PAGE 3: Health Assessment
+# -------------------------------------------------
+elif page == "Health Assessment":
     st.subheader("🏥 Motor Health Assessment")
     st.markdown("Assess motor health status, health score (1-10), and detect potential failure types.")
 
-    raw_data, engineered_data = get_input_data()
+    if not show_input_status():
+        st.stop()
 
-    if raw_data is not None:
-        if st.button("Assess Health", type="primary"):
-            # Get engineered features for health model
-            health_features = engineer_features(
-                pd.DataFrame({
-                    "Air temperature [K]": [engineered_data.iloc[i]["Air temperature [K]"] for i in range(len(engineered_data))],
-                    "Process temperature [K]": [engineered_data.iloc[i]["Process temperature [K]"] for i in range(len(engineered_data))],
-                    "Rotational speed [rpm]": [engineered_data.iloc[i]["Rotational speed [rpm]"] for i in range(len(engineered_data))],
-                    "Torque [Nm]": [engineered_data.iloc[i]["Torque [Nm]"] for i in range(len(engineered_data))],
-                    "Tool wear [min]": [engineered_data.iloc[i]["Tool wear [min]"] for i in range(len(engineered_data))],
-                }),
-                for_health_model=True
-            )
+    input_df, raw_data, failure_features, health_features = get_saved_input_data()
 
-            # Get predictions
-            health_preds = health_model.predict(health_features)
-            health_probs = health_model.predict_proba(health_features)
+    if st.button("Assess Health", type="primary"):
+        # Get predictions
+        health_preds = health_model.predict(health_features)
+        health_probs = health_model.predict_proba(health_features)
 
-            # Detect failure types
-            failure_results = detect_failure_types(health_features)
+        # Detect failure types
+        failure_results = detect_failure_types(health_features)
 
-            # Display results for each sample
-            for i in range(len(health_preds)):
-                st.markdown("---")
-                if len(health_preds) > 1:
-                    st.markdown(f"### Sample {i+1}")
+        # Display results for each sample
+        for i in range(len(health_preds)):
+            st.markdown("---")
+            if len(health_preds) > 1:
+                st.markdown(f"### Sample {i+1}")
 
-                # Health status
-                is_unhealthy = health_preds[i] == 1
-                unhealthy_prob = health_probs[i][1]
+            # Health status
+            is_unhealthy = health_preds[i] == 1
+            unhealthy_prob = health_probs[i][1]
 
-                # Risk severity for health score
-                risk_cols = ["hdf_risk_bin", "pwf_risk_bin", "osf_risk_bin", "twf_risk_bin"]
-                risk_severity = health_features[risk_cols].iloc[i].mean()
-                health_score = compute_health_score(unhealthy_prob, risk_severity)
+            # Risk severity for health score
+            risk_cols = ["hdf_risk_bin", "pwf_risk_bin", "osf_risk_bin", "twf_risk_bin"]
+            risk_severity = health_features[risk_cols].iloc[i].mean()
+            health_score = compute_health_score(unhealthy_prob, risk_severity)
 
-                # Display health status
-                col1, col2, col3 = st.columns(3)
+            # Display health status
+            col1, col2, col3 = st.columns(3)
 
-                with col1:
-                    if is_unhealthy:
-                        st.error("⚠️ **UNHEALTHY**")
-                    else:
-                        st.success("✅ **HEALTHY**")
-
-                with col2:
-                    # Health score with color coding
-                    if health_score >= 7:
-                        st.success(f"Health Score: **{health_score:.1f}/10**")
-                    elif health_score >= 4:
-                        st.warning(f"Health Score: **{health_score:.1f}/10**")
-                    else:
-                        st.error(f"Health Score: **{health_score:.1f}/10**")
-
-                with col3:
-                    st.metric("Unhealthy Probability", f"{unhealthy_prob*100:.1f}%")
-
-                # Health score progress bar
-                st.progress(float(health_score / 10))
-
-                # Detected failure types
-                failures = failure_results[i]
-                if failures["failure_count"] > 0:
-                    st.markdown("#### Detected Issues")
-                    for f in failures["failure_types"]:
-                        severity_color = "red" if f["severity"] >= 0.4 else "orange" if f["severity"] >= 0.2 else "yellow"
-                        st.markdown(f"""
-                        **{f['icon']} {f['type']}**
-                        - Severity: **{f['severity_label']}** ({f['severity']*100:.0f}%)
-                        - {f['details']}
-                        """)
+            with col1:
+                if is_unhealthy:
+                    st.error("⚠️ **UNHEALTHY**")
                 else:
-                    st.info("No issues detected - Motor is operating within normal parameters.")
+                    st.success("✅ **HEALTHY**")
+
+            with col2:
+                # Health score with color coding
+                if health_score >= 7:
+                    st.success(f"Health Score: **{health_score:.1f}/10**")
+                elif health_score >= 4:
+                    st.warning(f"Health Score: **{health_score:.1f}/10**")
+                else:
+                    st.error(f"Health Score: **{health_score:.1f}/10**")
+
+            with col3:
+                st.metric("Unhealthy Probability", f"{unhealthy_prob*100:.1f}%")
+
+            # Health score progress bar
+            st.progress(float(health_score / 10))
+
+            # Detected failure types
+            failures = failure_results[i]
+            if failures["failure_count"] > 0:
+                st.markdown("#### Detected Issues")
+                for f in failures["failure_types"]:
+                    st.markdown(f"""
+                    **{f['icon']} {f['type']}**
+                    - Severity: **{f['severity_label']}** ({f['severity']*100:.0f}%)
+                    - {f['details']}
+                    """)
+            else:
+                st.info("No issues detected - Motor is operating within normal parameters.")
 
 # -------------------------------------------------
-# PAGE 2: Failure Prediction (Multi-class)
+# PAGE 4: Failure Prediction (Multi-class)
 # -------------------------------------------------
 elif page == "Failure Prediction":
     st.subheader("🔮 Failure Type Prediction")
@@ -488,120 +538,111 @@ elif page == "Failure Prediction":
         "Random Failure": "Random/unexplained failure event"
     }
 
-    raw_data, engineered_data = get_input_data()
+    if not show_input_status():
+        st.stop()
 
-    if raw_data is not None:
-        if st.button("Predict Failure Type", type="primary"):
-            preds = failure_pred_model.predict(engineered_data)
-            probs = failure_pred_model.predict_proba(engineered_data)
-            class_names = failure_pred_model.classes_
+    input_df, raw_data, failure_features, health_features = get_saved_input_data()
 
-            for i, pred in enumerate(preds):
-                st.markdown("---")
-                if len(preds) > 1:
-                    st.markdown(f"### Sample {i+1}")
+    if st.button("Predict Failure Type", type="primary"):
+        preds = failure_pred_model.predict(failure_features)
+        probs = failure_pred_model.predict_proba(failure_features)
+        class_names = failure_pred_model.classes_
 
-                # Get confidence for predicted class
-                pred_idx = list(class_names).index(pred)
-                confidence = probs[i][pred_idx]
+        for i, pred in enumerate(preds):
+            st.markdown("---")
+            if len(preds) > 1:
+                st.markdown(f"### Sample {i+1}")
 
-                # Display prediction
-                icon = failure_icons.get(pred, "❓")
-                description = failure_descriptions.get(pred, "")
+            # Get confidence for predicted class
+            pred_idx = list(class_names).index(pred)
+            confidence = probs[i][pred_idx]
 
-                if pred == "No Failure":
-                    st.success(f"{icon} **{pred}**")
-                    st.markdown(f"*{description}*")
-                else:
-                    st.error(f"{icon} **{pred}**")
-                    st.markdown(f"*{description}*")
+            # Display prediction
+            icon = failure_icons.get(pred, "❓")
+            description = failure_descriptions.get(pred, "")
 
-                # Confidence
-                col1, col2 = st.columns([1, 3])
-                with col1:
-                    st.metric("Confidence", f"{confidence*100:.1f}%")
-                with col2:
-                    st.progress(float(confidence))
+            if pred == "No Failure":
+                st.success(f"{icon} **{pred}**")
+                st.markdown(f"*{description}*")
+            else:
+                st.error(f"{icon} **{pred}**")
+                st.markdown(f"*{description}*")
 
-                # Show top 3 predictions with probabilities
-                st.markdown("**Probability Distribution:**")
-                sorted_indices = np.argsort(probs[i])[::-1][:3]
-                for idx in sorted_indices:
-                    class_name = class_names[idx]
-                    prob = probs[i][idx]
-                    icon = failure_icons.get(class_name, "")
-                    if prob > 0.01:  # Only show if > 1%
-                        st.markdown(f"- {icon} {class_name}: {prob*100:.1f}%")
+            # Confidence
+            col1, col2 = st.columns([1, 3])
+            with col1:
+                st.metric("Confidence", f"{confidence*100:.1f}%")
+            with col2:
+                st.progress(float(confidence))
+
+            # Show top 3 predictions with probabilities
+            st.markdown("**Probability Distribution:**")
+            sorted_indices = np.argsort(probs[i])[::-1][:3]
+            for idx in sorted_indices:
+                class_name = class_names[idx]
+                prob = probs[i][idx]
+                icon = failure_icons.get(class_name, "")
+                if prob > 0.01:  # Only show if > 1%
+                    st.markdown(f"- {icon} {class_name}: {prob*100:.1f}%")
 
 # -------------------------------------------------
-# PAGE 3: Remaining Useful Life (RUL)
+# PAGE 5: Remaining Useful Life (RUL)
 # -------------------------------------------------
 elif page == "Remaining Useful Life (RUL)":
     st.subheader("⏱️ Remaining Useful Life Estimation")
     st.markdown("Estimate remaining operational hours based on current conditions and degradation rate.")
 
-    raw_data, engineered_data = get_input_data()
+    if not show_input_status():
+        st.stop()
 
-    if raw_data is not None:
-        if st.button("Estimate RUL", type="primary"):
-            # Build DataFrame for RUL feature engineering
-            df_for_rul = pd.DataFrame({
-                "Air temperature [K]": engineered_data["Air temperature [K]"].values,
-                "Process temperature [K]": engineered_data["Process temperature [K]"].values,
-                "Rotational speed [rpm]": engineered_data["Rotational speed [rpm]"].values,
-                "Torque [Nm]": engineered_data["Torque [Nm]"].values,
-                "Tool wear [min]": engineered_data["Tool wear [min]"].values,
-            })
+    input_df, raw_data, failure_features, health_features = get_saved_input_data()
 
-            # Engineer RUL features
-            rul_features, degradation_rates = engineer_rul_features(df_for_rul)
+    if st.button("Estimate RUL", type="primary"):
+        # Engineer RUL features
+        rul_features, degradation_rates = engineer_rul_features(input_df)
 
-            # Predict RUL
-            rul_preds = rul_model.predict(rul_features)
+        # Predict RUL
+        rul_preds = rul_model.predict(rul_features)
 
-            for i, rul in enumerate(rul_preds):
-                st.markdown("---")
-                if len(rul_preds) > 1:
-                    st.markdown(f"### Sample {i+1}")
+        for i, rul in enumerate(rul_preds):
+            st.markdown("---")
+            if len(rul_preds) > 1:
+                st.markdown(f"### Sample {i+1}")
 
-                # Display RUL with appropriate styling
-                col1, col2, col3 = st.columns(3)
+            # Display RUL with appropriate styling
+            col1, col2, col3 = st.columns(3)
 
-                with col1:
-                    if rul < 20:
-                        st.error(f"⚠️ **CRITICAL**")
-                        rul_color = "error"
-                    elif rul < 50:
-                        st.warning(f"⏰ **WARNING**")
-                        rul_color = "warning"
-                    elif rul < 100:
-                        st.info(f"📊 **MODERATE**")
-                        rul_color = "info"
-                    else:
-                        st.success(f"✅ **GOOD**")
-                        rul_color = "success"
-
-                with col2:
-                    st.metric("Estimated RUL", f"{rul:.1f} hours")
-
-                with col3:
-                    deg_rate = degradation_rates.iloc[i]
-                    st.metric("Degradation Rate", f"{deg_rate:.2f}x")
-
-                # Progress bar (inverted - lower RUL = more filled)
-                max_rul = 253  # Max possible RUL
-                rul_progress = max(0, min(1, rul / max_rul))
-                st.progress(rul_progress)
-
-                # Recommendations
+            with col1:
                 if rul < 20:
-                    st.markdown("**Recommendation:** Immediate maintenance required. Stop operation if possible.")
+                    st.error(f"⚠️ **CRITICAL**")
                 elif rul < 50:
-                    st.markdown("**Recommendation:** Schedule maintenance within the next shift.")
+                    st.warning(f"⏰ **WARNING**")
                 elif rul < 100:
-                    st.markdown("**Recommendation:** Plan maintenance in the next 1-2 days.")
+                    st.info(f"📊 **MODERATE**")
                 else:
-                    st.markdown("**Recommendation:** Normal operation. Continue monitoring.")
+                    st.success(f"✅ **GOOD**")
+
+            with col2:
+                st.metric("Estimated RUL", f"{rul:.1f} hours")
+
+            with col3:
+                deg_rate = degradation_rates.iloc[i]
+                st.metric("Degradation Rate", f"{deg_rate:.2f}x")
+
+            # Progress bar (inverted - lower RUL = more filled)
+            max_rul = 253  # Max possible RUL
+            rul_progress = max(0, min(1, rul / max_rul))
+            st.progress(rul_progress)
+
+            # Recommendations
+            if rul < 20:
+                st.markdown("**Recommendation:** Immediate maintenance required. Stop operation if possible.")
+            elif rul < 50:
+                st.markdown("**Recommendation:** Schedule maintenance within the next shift.")
+            elif rul < 100:
+                st.markdown("**Recommendation:** Plan maintenance in the next 1-2 days.")
+            else:
+                st.markdown("**Recommendation:** Normal operation. Continue monitoring.")
 
 # -------------------------------------------------
 # PAGE 4: Confusion Matrices
